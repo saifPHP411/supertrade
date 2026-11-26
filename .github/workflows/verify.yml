@@ -28,7 +28,21 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
+      - run: docker build --platform linux/amd64 --tag supertrade:verified .
+      - name: Check image architecture and history
+        run: |
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' supertrade:verified)" = linux/amd64
+          docker history --no-trunc --format '{{.CreatedBy}}' supertrade:verified > /tmp/supertrade-history
+          if grep -Eiq '(BINANCE_(PAPER|LIVE)_(KEY|SECRET)|SUPERTRADE_DASHBOARD_PASSWORD)[[:space:]]*=' /tmp/supertrade-history; then
+            echo 'A secret variable assignment was found in image history'
+            exit 1
+          fi
       - run: docker compose up -d --build --wait
-      - run: curl --fail --show-error http://127.0.0.1:8080/api/health
+      - run: curl --fail --show-error http://127.0.0.1:8080/health
+      - name: Restart with mounted state
+        run: |
+          docker compose restart supertrade
+          curl --fail --show-error --retry 12 --retry-all-errors http://127.0.0.1:8080/health
+          docker compose exec -T supertrade test -s /data/state.sqlite3
       - run: docker compose logs
         if: failure()

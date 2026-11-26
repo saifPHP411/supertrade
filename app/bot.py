@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import math
 import os
 import threading
@@ -26,6 +28,8 @@ from .strategy import (
     within_budget,
 )
 
+logger = logging.getLogger("uvicorn.error")
+
 
 class Bot:
     def __init__(self, store):
@@ -41,7 +45,12 @@ class Bot:
         self.equity = None
         self.last_error = None
         self.alert_thread = None
-        self.mode = store.get("mode", "paper")
+        self.paper_only = bool(os.getenv("RAILWAY_SERVICE_ID")) or os.getenv("SUPERTRADE_PAPER_ONLY") == "true"
+        self.resume_paper = os.getenv("SUPERTRADE_RESUME_PAPER") == "true"
+        self.verification = os.getenv("SUPERTRADE_PAPER_PHASE") == "verification"
+        self.recovered = False
+        self.last_progress = 0
+        self.mode = "paper" if self.paper_only else store.get("mode", "paper")
         self.preset = store.get("edge_preset", "MAX GROWTH")
         if self.preset not in PRESETS:
             self.preset = "MAX GROWTH"
@@ -77,13 +86,14 @@ class Bot:
                 return plan
         return None
 
-    def scope(self, mode):
+    def scope(self, mode, *, official=False):
         plan = self.plan()
         identifier = plan.fingerprint if plan else "edge-hunt-unqualified"
-        return f"{self.account_id(mode)}:{identifier}:{self.capital:g}"
+        scope = f"{self.account_id(mode)}:{identifier}:{self.capital:g}"
+        return f"{scope}:verification" if mode == "paper" and self.verification and not official else scope
 
     def gate(self):
-        result = live_gate(self.store, self.scope("paper"))
+        result = live_gate(self.store, self.scope("paper", official=True))
         qualified = self.plan() is not None
         result["checks"].insert(0, {"label": "Tournament survivor for this preset and allocation",
                                     "value": "Qualified" if qualified else "Pending", "target": "Qualified",
@@ -93,6 +103,8 @@ class Bot:
 
     def event(self, level, message):
         self.store.log(level, message)
+        if self.paper_only:
+            logger.info("supertrade %s %s", level, message)
         if (level == "alert" and os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")
                 and (self.alert_thread is None or not self.alert_thread.is_alive())):
             self.alert_thread = threading.Thread(target=self.telegram, args=(message,), daemon=True)
@@ -107,7 +119,7 @@ class Bot:
             self.store.log("warning", "Telegram alert could not be delivered")
 
     def authorize(self, mode):
-        if mode == "live" and (os.getenv("ENABLE_LIVE_TRADING") != "true" or not self.gate()["passed"]):
+        if mode == "live" and (self.paper_only or os.getenv("ENABLE_LIVE_TRADING") != "true" or not self.gate()["passed"]):
             raise ExchangeError("Live trading is locked by the paper gate or local opt-in")
 
     def connect(self, mode):
@@ -117,12 +129,38 @@ class Bot:
         if self.data["account"] and self.data["account"] != account_id:
             raise ExchangeError("This ledger belongs to a different exchange key or endpoint")
         adapter = Binance(mode, key, secret, os.getenv("BINANCE_PAPER_ENV", "demo"), lambda: self.authorize(mode))
+        if self.paper_only and os.getenv("BINANCE_PAPER_ENV", "demo") != "demo":
+            raise ExchangeError("Hosted execution is restricted to Binance Futures Demo")
         self.exchange = adapter
+
+    def verify_account(self):
+        unknown = set(self.broker_positions) - self.data["positions"].keys()
+        orders = [order for order in self.orders if not order["client"].startswith("st-")]
+        if unknown or orders:
+            raise ExchangeError("The account must be dedicated to Supertrade and free of unmanaged exposure")
+
+    def recover(self):
+        if (self.mode != "paper" or not self.resume_paper or not self.data.get("resume")
+                or self.data["killed"] or self.data["flatten"] or (self.data["risk"] or {}).get("halted")):
+            return
+        if not self.plan() or self.data["resume"] != self.scope("paper") or not all(self.credentials("paper")):
+            raise ExchangeError("Paper recovery requires the original credentials, phase and qualified plan")
+        if not self.exchange:
+            self.connect("paper")
+        self.exchange.verify_mode()
+        self.refresh()
+        self.verify_account()
+        self.reconcile(int(time.time()))
+        self.recovered = self.running = True
+        self.event("info", f"Paper restart reconciled: {len(self.broker_positions)} exchange positions, "
+                           f"{len(self.orders)} exchange orders; last consumed bar {self.data['last_bar']}")
 
     def configure(self, preset):
         with self.lock:
             if self.running or self.data["positions"] or self.data["flatten"]:
                 raise ExchangeError("Stop the engine and settle positions before changing the risk preset")
+            self.data["resume"] = None
+            self.save()
             self.preset = preset
             self.store.state("edge_preset", preset)
             self.regime = None
@@ -153,11 +191,10 @@ class Bot:
                 self.connect(mode)
                 self.exchange.verify_mode()
                 self.refresh()
-                unknown = set(self.broker_positions) - self.data["positions"].keys()
-                unknown_orders = [order for order in self.orders if not order["client"].startswith("st-")]
-                if unknown or unknown_orders:
-                    raise ExchangeError("The account must be dedicated to Supertrade and free of unmanaged exposure")
+                self.verify_account()
+                self.reconcile(int(time.time()))
                 self.data["account"] = self.account_id(mode)
+                self.data["resume"] = self.scope(mode) if mode == "paper" else None
                 self.save()
             except Exception:
                 self.mode, self.data, self.exchange = old_mode, old_data, old_exchange
@@ -176,6 +213,8 @@ class Bot:
         self.interrupt.set()
         with self.lock:
             self.running = self.healthy = False
+            self.data["resume"] = None
+            self.save()
             self.event("info", "New entries disabled. Existing positions are still monitored.")
             return self.snapshot()
 
@@ -206,6 +245,7 @@ class Bot:
         self.interrupt.set()
         with self.lock:
             self.running = self.healthy = False
+            self.data["resume"] = None
             self.data["killed"] = self.data["flatten"] = True
             self.save()
             self.event("alert", f"Kill switch latched for {self.mode.upper()}. Flatten requested.")
@@ -226,17 +266,45 @@ class Bot:
         self.equity = max(0.0, min(wallet, allocated + wallet - self.data["anchor"]))
         self.broker_positions, self.orders = positions, orders
         self.verified_at = int(time.time())
+        self.data["broker_snapshot"] = {"at": self.verified_at, "positions": positions, "orders": orders,
+                                        "equity": self.equity}
+        self.save()
 
     def close_market(self, symbol, position):
         quantity = self.exchange.quantity(symbol, position["size"], position["mark"], entry=False)
         if not quantity:
             raise ExchangeError(f"Unable to express the remaining {symbol} position at exchange precision")
-        self.exchange.market_order(symbol, -position["side"], quantity, "st-x-" + uuid.uuid4().hex[:24], reduce=True)
+        pending = self.data.setdefault("close_intents", {})
+        intent = pending.get(symbol)
+        if intent:
+            order = self.exchange.find_entry(symbol, intent["id"])
+            if order and order["status"] in {"NEW", "PARTIALLY_FILLED"}:
+                return
+            if (order and order["status"] == "FILLED"
+                    and position["size"] >= intent.get("size", position["size"])):
+                return
+            if not order and time.time() - intent["at"] < 60:
+                return
+            # A fresh exchange snapshot reported remaining exposure. Any new attempt is reduce-only.
+        client = "st-x-" + uuid.uuid4().hex[:24]
+        intent = {"id": client, "at": int(time.time()), "size": position["size"]}
+        managed = self.data["positions"].get(symbol)
+        if self.paper_only and managed:
+            try:
+                managed.setdefault("references", {})[client] = self.exchange.midpoint(symbol)
+            except (ccxt.BaseError, ExchangeError):
+                self.event("warning", f"{symbol} close will proceed without a slippage reference")
+        pending[symbol] = intent
+        self.save()
+        self.exchange.market_order(symbol, -position["side"], quantity, client, reduce=True)
 
     def flatten(self):
         if not self.exchange:
             self.connect(self.mode)
         self.refresh()
+        self.data["flatten_initial_positions"] = max(len(self.broker_positions),
+                                                     self.data.get("flatten_initial_positions", 0))
+        self.save()
         errors = []
         # Cancel working entry orders first. Leave native protection while reducing exposure.
         for order in self.orders:
@@ -262,6 +330,10 @@ class Bot:
             raise ExchangeError(f"Flatten pending: {len(self.broker_positions)} positions and {len(self.orders)} orders remain") from (
                 errors[0] if errors else None)
         self.reconcile(int(time.time()))
+        self.data["close_intents"] = {}
+        self.data["last_flatten"] = {"at": self.verified_at, "positions": 0, "orders": 0,
+                                     "initial_positions": self.data.get("flatten_initial_positions", 0)}
+        self.data["flatten_initial_positions"] = 0
         self.data["flatten"] = False
         self.save()
         self.event("info", "Exchange confirmed zero positions and zero open orders")
@@ -327,8 +399,15 @@ class Bot:
             actual = self.exchange.outcome(symbol, int(order["time"]))
             if actual is None:
                 continue
+            fills = actual.pop("fills", [])
+            references = managed.get("references", {})
+            for fill in fills:
+                reference = references.get(fill["client_id"])
+                if reference:
+                    fill["slippage"] = fill["side"] * (fill["price"] / reference - 1)
+                    fill["reference"] = reference
             trade = {**actual, "id": managed["id"], "symbol": symbol, "side": managed["side"],
-                     "opened": managed["opened"], "mode": self.mode, "scope": managed["scope"]}
+                     "opened": managed["opened"], "mode": self.mode, "scope": managed["scope"], "fills": fills}
             family = managed.get("family")
             if family:
                 trade["family"] = family
@@ -340,6 +419,7 @@ class Bot:
                 if risk.streak == 6:
                     self.event("alert", "Six consecutive net losses. New entries paused for two hours.")
             del self.data["positions"][symbol]
+            self.data.get("close_intents", {}).pop(symbol, None)
             self.save(trade)
             self.event("trade", f"{self.mode.upper()} {symbol} closed · net {trade['pnl']:+.4f} USDT")
         for order in self.orders:
@@ -389,10 +469,13 @@ class Bot:
                 self.exchange.prepare_symbol(symbol)
                 if self.interrupt.is_set():
                     return
-                client_id = "st-e-" + uuid.uuid4().hex[:24]
+                payload = f"{self.scope(self.mode)}:{stamp // BAR}:{family}:{symbol}"
+                client_id = "st-e-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+                reference = self.exchange.midpoint(symbol) if self.paper_only else None
                 managed[symbol] = {
                     "id": client_id, "family": family, "side": side, "opened": stamp, "gap": gap,
                     "scope": self.scope(self.mode),
+                    "references": {client_id: reference} if reference else {},
                     "risk_budget": min(self.equity * hard_cap * allocation * risk.scale(self.equity)
                                        * (0.5 if family == "B" and side == -1 else 1),
                                        float(rounded) * (gap + (mark + gap) * 2 * (FEE + SLIP))),
@@ -413,9 +496,13 @@ class Bot:
             return
         self.refresh()
         stamp = int(time.time())
-        if set(self.broker_positions) - self.data["positions"].keys():
+        try:
+            self.verify_account()
+        except ExchangeError:
             self.running = False
-            raise ExchangeError("Unmanaged exchange exposure found. Use the kill switch to flatten.")
+            self.data["resume"] = None
+            self.save()
+            raise
         risk = Risk(**self.data["risk"]) if self.data["risk"] else Risk(self.equity, self.equity, stamp // DAY)
         was_daily, was_halted = risk.daily_locked, risk.halted
         risk.observe(stamp, self.equity, self.preset)
@@ -423,6 +510,8 @@ class Bot:
         self.save()
         if risk.halted:
             self.running = False
+            self.data["resume"] = None
+            self.save()
             if not was_halted:
                 self.event("alert", "Maximum drawdown hit. Manual reset required.")
         if risk.daily_locked and not was_daily:
@@ -472,6 +561,36 @@ class Bot:
         self.store.sample(self.mode, self.scope(self.mode), stamp, self.equity,
                           self.running and self.regime is not None, continuous=self.healthy)
         self.healthy = self.running and self.regime is not None
+        if self.paper_only and self.mode == "paper" and self.healthy and stamp - self.last_progress >= 3600:
+            gate = live_gate(self.store, self.scope("paper"))
+            logger.info("supertrade paper progress %s", json.dumps({
+                "phase": "verification" if self.verification else "gate", "checks": gate["checks"],
+                "exchange_positions": len(self.broker_positions), "exchange_orders": len(self.orders),
+                "verified_at": self.verified_at,
+            }, separators=(",", ":")))
+            self.last_progress = stamp
+
+    def paper_evidence(self):
+        with self.lock:
+            if self.mode != "paper":
+                raise ExchangeError("Paper evidence requires the paper account")
+            scope = self.scope("paper")
+            ledger = self.store.paper_trades(scope)
+            intervals, _, _ = self.store.evidence(scope)
+            if not self.exchange:
+                self.connect("paper")
+            self.refresh()
+            fills = [fill for trade in ledger for fill in trade.get("fills", [])]
+            measured = [fill for fill in fills if "slippage" in fill]
+            weight = sum(f["reference"] * f["quantity"] for f in measured)
+            notional = sum(f["price"] * f["quantity"] for f in fills)
+            costs = {"matched_fills": len(measured), "total_fills": len(fills),
+                     "slippage": sum(f["slippage"] * f["reference"] * f["quantity"] for f in measured) / weight if weight else None,
+                     "fee_rate": sum(f["fee"] for f in fills) / notional if notional else None,
+                     "modeled_slippage": SLIP, "modeled_fee": FEE}
+            return {"phase": "verification" if self.verification else "gate", "demo_host":
+                    self.exchange.host, "exchange_snapshot": self.data["broker_snapshot"], "costs": costs,
+                    "verified_intervals": intervals, "last_flatten": self.data.get("last_flatten"), "round_trips": ledger}
 
     def report_error(self, error):
         self.healthy = False
@@ -482,15 +601,22 @@ class Bot:
         self.last_error = message
 
     def loop(self):
+        delay = 12
         while not self.stopping.is_set():
             with self.lock:
-                if self.running or self.data["positions"] or self.data["flatten"]:
-                    try:
+                recoverable = self.mode == "paper" and self.resume_paper and self.data.get("resume") and not self.running
+                try:
+                    if recoverable:
+                        self.recover()
+                    if self.running or self.data["positions"] or self.data["flatten"]:
                         self.tick()
                         self.last_error = None
-                    except Exception as error:  # noqa: BLE001 — keep monitoring after recoverable failures
-                        self.report_error(error)
-            self.stopping.wait(12)
+                    delay = 12
+                except Exception as error:  # noqa: BLE001 — keep reconciling after recoverable failures
+                    self.report_error(error)
+                    self.exchange = None
+                    delay = min(delay * 2, 120)
+            self.stopping.wait(delay)
 
     def snapshot(self):
         with self.lock:
@@ -510,11 +636,12 @@ class Bot:
             release = self.store.get("edge_release", {})
             return {"mode": self.mode, "running": self.running, "equity": self.equity,
                     "strategy": {"preset": self.preset, "families": list(plan.families) if plan else []},
-                    "edge_available": plan is not None,
+                    "edge_available": plan is not None, "paper_recovered": self.recovered,
+                    "paper_phase": "verification" if self.verification else "gate",
                     "edge_status": release.get("status", {}).get(self.preset, "UNDER REVIEW"),
                     "positions": positions, "orders": self.orders, "verified_at": self.verified_at,
                     "regime": self.regime, "pnl": pnl, "curve": marks, "risk": risk, "killed": self.data["killed"],
                     "flatten_pending": self.data["flatten"], "error": self.last_error, "gate": gate,
                     "paper_configured": all(self.credentials("paper")),
-                    "live_available": gate["passed"] and os.getenv("ENABLE_LIVE_TRADING") == "true"
+                    "live_available": not self.paper_only and gate["passed"] and os.getenv("ENABLE_LIVE_TRADING") == "true"
                     and all(self.credentials("live"))}

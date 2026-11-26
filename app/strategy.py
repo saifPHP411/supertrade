@@ -126,7 +126,7 @@ def within_budget(family, now, entries, exits, active):
     return len(prune_budget(entries, now)) < limit and len(prune_budget(exits, now)) + active < limit
 
 
-def size_position(preset, family, side, equity, gross, reserved, price, gap, scale, allocation=1.0):
+def size_position(preset, family, side, equity, gross, reserved, price, gap, scale, allocation=1.0, *, costs=FEE + SLIP):
     if equity <= 0 or price <= 0 or not 0 < gap < price:
         return 0.0
     limits = PRESETS[preset]
@@ -134,5 +134,5 @@ def size_position(preset, family, side, equity, gross, reserved, price, gap, sca
     if family == "B" and side == -1:
         budget *= 0.5
     budget = min(budget, max(0.0, equity * limits.daily_loss - reserved))
-    loss_per_unit = gap + (price + gap) * 2 * (FEE + SLIP)
+    loss_per_unit = gap + (price + gap) * 2 * costs
     return max(0.0, min(budget / loss_per_unit, (equity * 0.98 - gross) / price))

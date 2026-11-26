@@ -43,6 +43,7 @@ class Binance:
                 raise ExchangeError("Unexpected Binance Futures endpoint")
         # Honor standard HTTPS proxy and CA bundle settings for local installations.
         self.exchange.session.trust_env = True
+        self.host = expected
         self.market_rules = {}
         self.history = {}
 
@@ -168,7 +169,18 @@ class Binance:
         fees = sum(float(row["commission"]) for row in fills)
         credit = sum(float(row["income"]) for row in funding)
         pnl = sum(float(row["realizedPnl"]) for row in fills) - fees + credit
-        return {"pnl": pnl, "fees": fees, "funding": credit, "closed": max(int(row["time"]) // 1000 for row in fills)}
+        order_ids = {str(row["orderId"]) for row in fills}
+        clients = {}
+        for order_id in order_ids:
+            order = self.exchange.fapiPrivateGetOrder({"symbol": symbol + "USDT", "orderId": order_id})
+            clients[order_id] = order["clientOrderId"]
+        evidence = [{"order_id": str(row["orderId"]), "trade_id": str(row["id"]),
+                     "client_id": clients[str(row["orderId"])], "at": int(row["time"]),
+                     "side": 1 if row["side"] == "BUY" else -1,
+                     "price": float(row["price"]), "quantity": float(row["qty"]),
+                     "fee": float(row["commission"])} for row in fills]
+        return {"pnl": pnl, "fees": fees, "funding": credit,
+                "closed": max(int(row["time"]) // 1000 for row in fills), "fills": evidence}
 
     def signal_features(self, symbols, stamp, interrupt=None):
         daily, four = {}, {}
@@ -209,3 +221,11 @@ class Binance:
         if not np.isfinite(mark) or mark <= 0:
             raise ExchangeError(f"Missing {symbol} mark price")
         return mark
+
+
+    def midpoint(self, symbol):
+        q = self.exchange.fapiPublicGetTickerBookTicker({"symbol": symbol + "USDT"})
+        bid, ask = float(q["bidPrice"]), float(q["askPrice"])
+        if not (0 < bid <= ask and np.isfinite(ask)):
+            raise ExchangeError("No valid Binance Demo order-book midpoint")
+        return (bid + ask) / 2

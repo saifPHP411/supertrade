@@ -114,3 +114,29 @@ Platform-specific binaries sharing a license are grouped by package prefix.
 | ISC | `electron-to-chromium`, `lru-cache`, `lucide-react`, `picocolors`, `semver`, `yallist` |
 | MIT | `@babel/code-frame`, `@babel/compat-data`, `@babel/core`, `@babel/generator`, `@babel/helper-compilation-targets`, `@babel/helper-globals`, `@babel/helper-module-imports`, `@babel/helper-module-transforms`, `@babel/helper-plugin-utils`, `@babel/helper-string-parser`, `@babel/helper-validator-identifier`, `@babel/helper-validator-option`, `@babel/helpers`, `@babel/parser`, `@babel/plugin-transform-react-jsx-self`, `@babel/plugin-transform-react-jsx-source`, `@babel/template`, `@babel/traverse`, `@babel/types`, `@esbuild/*`, `@jridgewell/gen-mapping`, `@jridgewell/remapping`, `@jridgewell/resolve-uri`, `@jridgewell/sourcemap-codec`, `@jridgewell/trace-mapping`, `@rolldown/pluginutils`, `@rollup/rollup-*`, `@tailwindcss/node`, `@tailwindcss/oxide`, `@tailwindcss/oxide-*`, `@tailwindcss/vite`, `@types/babel__core`, `@types/babel__generator`, `@types/babel__template`, `@types/babel__traverse`, `@types/estree`, `@vitejs/plugin-react`, `browserslist`, `convert-source-map`, `debug`, `enhanced-resolve`, `esbuild`, `escalade`, `fancy-canvas`, `fdir`, `fsevents`, `gensync`, `jiti`, `js-tokens`, `jsesc`, `json5`, `magic-string`, `ms`, `nanoid`, `node-releases`, `picomatch`, `postcss`, `react`, `react-dom`, `react-refresh`, `rollup`, `scheduler`, `tailwindcss`, `tapable`, `tinyglobby`, `update-browserslist-db`, `vite` |
 | MPL-2.0 | `lightningcss`, `lightningcss-*` |
+
+## Running on Railway
+
+Create a private project and a single service connected to this GitHub repository. Attach a persistent volume at `/data`. The Dockerfile builds the frontend and serves it with FastAPI. The entry point binds to `0.0.0.0:$PORT`, checks for the mounted volume, and drops privileges before starting the server. Set the service startup healthcheck to `/health`, allow 120 seconds, keep one replica, and disable Serverless where the plan permits it. The volume stores the SQLite journal, positions and order snapshots, trade and verification records, and archive cache.
+
+| Variable | Value |
+|---|---|
+| `BINANCE_PAPER_KEY` | Binance Futures Demo API key, entered in Railway Variables |
+| `BINANCE_PAPER_SECRET` | Binance Futures Demo API secret, entered in Railway Variables |
+| `BINANCE_PAPER_ENV` | `demo` |
+| `ENABLE_LIVE_TRADING` | `false` |
+| `SUPERTRADE_PAPER_ONLY` | `true` |
+| `SUPERTRADE_RESUME_PAPER` | `true` |
+| `SUPERTRADE_PAPER_PHASE` | `verification` for the first 24 hours, then `gate` after verifying and flattening |
+| `SUPERTRADE_DASHBOARD_PASSWORD` | Unique random password of 24 or more characters. Browser username is `supertrade`. |
+| `CAPITAL_LIMIT` | `50` for the qualified baseline |
+| `SUPERTRADE_DATA` | `/data` |
+| `RAILWAY_RUN_UID` | `0` so the launcher can prepare the volume before dropping privileges |
+
+Create keys from the Account menu → **API Management** → **Create API** inside [Binance Futures Demo](https://demo.binance.com/en/futures). Binance gates Demo access by region and account eligibility. Use a dedicated USDⓈ-M single-asset USDT account in one-way mode. The bot sets leverage to 1×. Add the secrets only in Railway Variables. The Railway runtime independently rejects live orders even if the environment flag is changed.
+
+An explicitly started paper engine keeps its recovery intent in SQLite. On restart it verifies the account and position mode, refreshes broker positions and orders, and reconciles fills by their original client order IDs before resuming. The consumed signal bar is persisted before entry submission. An ambiguous entry is looked up at the exchange and is never replayed for the same bar. Close attempts use reduce-only orders and wait for authenticated confirmation of remaining exposure before retrying. A manual stop, kill switch, or drawdown stop clears recovery intent. API failures back off from 24 seconds to two minutes. Restarts interrupt unattended coverage.
+
+The protected `GET /api/paper/evidence` returns a fresh authenticated account snapshot, verified uptime intervals, kill-switch counts and matched exchange order/fill IDs with side, size, price and fee. For bot-submitted market orders, slippage uses the signed distance from a captured pre-order book midpoint and is weighted by reference notional. Native protective orders without a matched reference are counted in fill coverage and excluded from the slippage estimate. The fee rate uses actual commission over executed notional. Report the sample size and treat Demo estimates as specific to Demo liquidity. If measured slippage exceeds 0.05% by at least 0.02 percentage points on a representative sample, rerun all presets with `python -m app.research --fee <decimal> --slippage <decimal>`. This rerun is exploratory and does not replace the qualified baseline. The verification phase contributes no days or trades to the official gate.
+
+Railway Free is $0/month with $1 of monthly resources and serverless sleep. Hobby has a $5/month minimum, and Pro a $20/month minimum, both with usage charges above included credits. Hobby can run continuously when Serverless is disabled and sufficient compute budget is available. A compute hard limit can stop services mid-run. Check the workspace plan, remaining credit and spend cap before starting. A volume-backed redeploy has brief downtime. Free/Trial support On Failure with up to 10 restarts. Paid tiers can use Always if desired. See [Railway pricing](https://docs.railway.com/pricing/plans), [Serverless](https://docs.railway.com/deployments/serverless), and [compute limits](https://docs.railway.com/pricing/cost-control).

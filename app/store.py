@@ -88,6 +88,11 @@ class Store:
                              (mode, scope, end)).fetchone()
             return row["equity"] if row else None
 
+    def paper_trades(self, scope):
+        with self.connect() as db:
+            rows = db.execute("SELECT payload FROM trades WHERE mode='paper' AND scope=? ORDER BY at", (scope,)).fetchall()
+        return [{k: v for k, v in json.loads(row[0]).items() if k != "scope"} for row in rows]
+
     def logs(self):
         with self.connect() as db:
             events = db.execute("SELECT at,level,message FROM events ORDER BY id DESC LIMIT 200").fetchall()

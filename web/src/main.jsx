@@ -178,7 +178,7 @@ function Presets({ selected, onChange, settings, report }) {
   })}</div>
 }
 
-function FeePanel({ title, metrics, aside }) {
+function FeePanel({ title, metrics, aside, costs }) {
   return <Card title={title} icon={Wallet} aside={aside}>
     <dl className="metric-grid fee-metrics">
       <div><dt>Gross return</dt><dd className={tone(metrics.gross_return)}>{pct(metrics.gross_return, true)}</dd></div>
@@ -188,16 +188,16 @@ function FeePanel({ title, metrics, aside }) {
       <div><dt>Net return</dt><dd className={tone(metrics.net_return)}>{pct(metrics.net_return, true)}</dd></div>
       <div><dt>Fees / gross P&L</dt><dd>{pct(metrics.fee_to_gross)}</dd></div>
     </dl>
-    <div className="inline-note">Fee ratio is shown when gross P&L is positive. Each entry and exit includes 0.10% taker fee and 0.05% slippage.</div>
+    <div className="inline-note">Fee ratio is shown when gross P&L is positive. Each entry and exit includes {pct(costs.fee_per_side)} taker fee and {pct(costs.slippage_per_side)} slippage.</div>
   </Card>
 }
 
-function Detail({ family, result, benchmarks, label }) {
+function Detail({ family, result, benchmarks, label, costs }) {
   const m = result.aggregate
   const shuffle = result.monte_carlo
   const overlays = useMemo(() => [['#78a4ee', benchmarks.BTC.curve], ['#d2a7ff', benchmarks.ETH.curve]], [benchmarks])
   return <div className="report">
-    <FeePanel title={`${label} · Cost breakdown`} metrics={m} aside={<EdgeBadge verdict={result.edge} />} />
+    <FeePanel title={`${label} · Cost breakdown`} metrics={m} costs={costs} aside={<EdgeBadge verdict={result.edge} />} />
     <Card title={`${label} · Unseen equity`} icon={ChartNoAxesCombined}>
       <div className="chart-legend"><span className="leg-strategy">Strategy</span><span className="leg-btc">BTC spot buy and hold</span>
         <span className="leg-eth">ETH spot buy and hold</span></div>
@@ -271,12 +271,12 @@ function Tournament({ report, settings, selectedPreset }) {
         {' '}Combined simulation fills · A {result.portfolio.trades_by_family.A} · B {result.portfolio.trades_by_family.B}</div>}
       {!report.qualification && <div className="inline-note">Search results are exploratory. Execution uses only the baseline qualification.</div>}
     </Card>
-    {result.portfolio && <FeePanel title="Combined half-risk portfolio" metrics={result.portfolio.aggregate}
+    {result.portfolio && <FeePanel title="Combined half-risk portfolio" metrics={result.portfolio.aggregate} costs={report}
       aside={<Badge>PF {factor(result.portfolio.aggregate)} · DD {pct(result.portfolio.aggregate.max_drawdown)}</Badge>} />}
     <div className="family-selector" role="group" aria-label="Strategy details">{families.map((key) => <button key={key}
       className={`button ${family === key ? 'primary' : 'secondary'}`} aria-pressed={family === key} onClick={() => setFamily(key)}>
       {key} · {strategyNames[key]}</button>)}</div>
-    <Detail family={family} result={result.strategies[family]} label={`${family} · ${strategyNames[family]}`} benchmarks={report.benchmarks} />
+    <Detail family={family} result={result.strategies[family]} label={`${family} · ${strategyNames[family]}`} benchmarks={report.benchmarks} costs={report} />
   </>
 }
 

@@ -78,7 +78,7 @@ def round_quantity(rules, unrounded, mark):
     return float(amount) if minimum <= amount <= maximum and amount * mark >= min_cost else 0.0
 
 
-def simulate(market, variants, schedule, family_names, preset, start, end, capital):
+def simulate(market, variants, schedule, family_names, preset, start, end, capital, *, fee=FEE, slippage=SLIP):
     # schedule is chronological and changes only the parameters of new entries.
     left, right = np.searchsorted(market.times, (start, end))
     if right <= left:
@@ -100,23 +100,25 @@ def simulate(market, variants, schedule, family_names, preset, start, end, capit
                 for row in np.flatnonzero(series[left:right]) + left:
                     candidate_rows.setdefault((f, index, row), []).append((symbol, int(series[row])))
 
+    fee_rate = fee
+
     def close(symbol, raw, stamp, bucket, reason):
         nonlocal cash, fees, slip
         p = positions.pop(symbol)
-        fill = raw * (1 - p.side * SLIP)
-        fee = fill * p.quantity * FEE
+        fill = raw * (1 - p.side * slippage)
+        fee = fill * p.quantity * fee_rate
         fees += fee
-        slip += raw * p.quantity * SLIP
+        slip += raw * p.quantity * slippage
         cash += p.side * (fill - p.fill) * p.quantity - fee
         gross_pnl = p.side * (raw - p.raw_entry) * p.quantity
-        slippage = p.quantity * SLIP * (raw + p.raw_entry)
-        net = gross_pnl - p.fee - fee - slippage + p.funding
+        trade_slippage = p.quantity * slippage * (raw + p.raw_entry)
+        net = gross_pnl - p.fee - fee - trade_slippage + p.funding
         exits[p.family] = prune_budget(exits[p.family], stamp)
         exits[p.family].append(stamp)
         trades.append({
             "family": p.family, "symbol": symbol, "side": p.side, "opened": p.opened, "closed": stamp,
             "hour": bucket, "net": float(net), "gross": float(gross_pnl), "fees": float(p.fee + fee),
-            "slippage": float(slippage), "funding": float(p.funding), "exposure_return": float(net / p.equity_at_entry),
+            "slippage": float(trade_slippage), "funding": float(p.funding), "exposure_return": float(net / p.equity_at_entry),
             "reason": reason,
         })
         risk.closed(stamp, net)
@@ -174,25 +176,25 @@ def simulate(market, variants, schedule, family_names, preset, start, end, capit
                     if not within_budget(family, stamp, entries[family], exits[family], active):
                         continue
                     mark = market.candles[symbol][row, 0]
-                    fill = mark * (1 + side * SLIP)
+                    fill = mark * (1 + side * slippage)
                     gap = stop_gap(family, fill, variant.signals.atr[symbol][row], variant.trend, variant.reversion)
                     gross = sum(p.quantity * market.candles[s][row, 0] for s, p in positions.items())
                     reserved = sum(p.quantity * (max(0, p.side * (market.candles[s][row, 0] - p.stop))
-                                                  + market.candles[s][row, 0] * (FEE + SLIP))
+                                                  + market.candles[s][row, 0] * (fee_rate + slippage))
                                    for s, p in positions.items())
                     quantity = size_position(preset, family, side, equity, gross, reserved, max(mark, fill),
-                                             gap, risk.scale(equity), allocation)
+                                             gap, risk.scale(equity), allocation, costs=fee_rate + slippage)
                     quantity = round_quantity(market.rules[symbol], quantity, mark)
                     if not quantity:
                         continue
-                    fee = fill * quantity * FEE
+                    fee = fill * quantity * fee_rate
                     positions[symbol] = Position(family, side, index, stamp, quantity, mark, fill,
                                                  fill - side * gap, fill, equity, fee)
                     entries[family].append(stamp)
                     fees += fee
-                    slip += mark * quantity * SLIP
+                    slip += mark * quantity * slippage
                     cash -= fee
-                    equity -= fee + mark * quantity * SLIP
+                    equity -= fee + mark * quantity * slippage
 
         for symbol, p in list(positions.items()):
             candle = market.candles[symbol][row]

@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
 import gzip
 import json
 import logging
 import os
+import secrets
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -27,6 +30,9 @@ from .store import Store
 
 logger = logging.getLogger(__name__)
 ROOT = Path(os.getenv("SUPERTRADE_DATA", "data"))
+RAILWAY = bool(os.getenv("RAILWAY_SERVICE_ID"))
+PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").lower()
+DASHBOARD_PASSWORD = os.getenv("SUPERTRADE_DASHBOARD_PASSWORD", "")
 
 
 @asynccontextmanager
@@ -39,13 +45,14 @@ async def lifespan(app):
         if release_path.is_file() and not app.state.store.get("edge_release"):
             with gzip.open(release_path, "rt") as source:
                 report = json.load(source)
-            if report["kind"] != f"tournament-{ENGINE_VERSION}" or report["spec"] != BASELINE_SPEC.model_dump(mode="json"):
+            if report["kind"] != f"tournament-{ENGINE_VERSION}" or report["spec"] != BASELINE_SPEC.evidence_spec():
                 raise RuntimeError("The benchmark release does not match this engine version")
             app.state.store.complete_tournament(f"baseline-{ENGINE_VERSION}", report)
         app.state.bot = Bot(app.state.store)
         app.state.runs_lock = threading.Lock()
         app.state.research = ThreadPoolExecutor(max_workers=1, thread_name_prefix="research")
         app.state.bot.worker.start()
+        logger.info("Supertrade started with persistent SQLite; paper-only=%s", app.state.bot.paper_only)
         try:
             yield
         finally:
@@ -55,20 +62,51 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Supertrade", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+allowed_hosts = ["localhost", "127.0.0.1", "healthcheck.railway.app"]
+if PUBLIC_DOMAIN:
+    allowed_hosts.append(PUBLIC_DOMAIN)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+
+def dashboard_authorized(header):
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        username, separator, password = base64.b64decode(token, validate=True).partition(b":")
+    except (ValueError, binascii.Error):
+        return False
+    return bool(username == b"supertrade" and separator and
+                secrets.compare_digest(password, DASHBOARD_PASSWORD.encode()))
 
 
 @app.middleware("http")
-async def local_actions(request, call_next):
+async def dashboard_access(request, call_next):
+    path = request.url.path
+    if path in {"/health", "/api/health"} and request.method in {"GET", "HEAD"}:
+        return await call_next(request)
+    if RAILWAY:
+        if not DASHBOARD_PASSWORD or len(DASHBOARD_PASSWORD) < 24:
+            if path == "/" and request.method == "GET":
+                return HTMLResponse("<h1>Supertrade</h1><p>Dashboard access awaits Railway configuration.</p>",
+                                    headers={"Cache-Control": "no-store"})
+            return JSONResponse({"detail": "Dashboard access is disabled until configured"}, status_code=503)
+        if not dashboard_authorized(request.headers.get("authorization", "")):
+            return JSONResponse({"detail": "Authentication required"}, status_code=401,
+                                headers={"WWW-Authenticate": 'Basic realm="Supertrade", charset="UTF-8"',
+                                         "Cache-Control": "no-store"})
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("origin")
-        if (origin and urlparse(origin).hostname not in {"localhost", "127.0.0.1"}) or request.headers.get(
-            "sec-fetch-site"
-        ) == "cross-site":
-            return JSONResponse({"detail": "Local-origin actions only"}, status_code=403)
+        expected = f"https://{PUBLIC_DOMAIN}" if RAILWAY else None
+        if origin and (origin != expected if RAILWAY else urlsplit(origin).hostname not in {"localhost", "127.0.0.1"}):
+            return JSONResponse({"detail": "Same-origin actions only"}, status_code=403)
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            return JSONResponse({"detail": "Same-origin actions only"}, status_code=403)
     response = await call_next(request)
-    if request.url.path.startswith("/api"):
+    if RAILWAY or path.startswith("/api"):
         response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 
@@ -90,6 +128,7 @@ def action(handler, *args):
         raise HTTPException(502, f"Bot action failed ({type(error).__name__})") from error
 
 
+@app.get("/health")
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -140,6 +179,11 @@ def reset():
 @app.get("/api/logs")
 def logs():
     return app.state.store.logs()
+
+
+@app.get("/api/paper/evidence")
+def paper_evidence():
+    return action(app.state.bot.paper_evidence)
 
 
 def execute(run_id, spec):

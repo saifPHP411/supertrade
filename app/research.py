@@ -129,10 +129,10 @@ def monte_carlo(trades):
             "drawdown_percentiles": quantiles}
 
 
-def benchmark(frame, capital):
+def benchmark(frame, capital, *, fee=FEE, slippage=SLIP):
     start = int(frame.index[0])
-    cost_basis = float(frame.open.iloc[0]) * (1 + SLIP) * (1 + FEE)
-    daily = [(start, capital)] + [(int(stamp + DAY), float(mark / cost_basis * capital * (1 - SLIP) * (1 - FEE)))
+    cost_basis = float(frame.open.iloc[0]) * (1 + slippage) * (1 + fee)
+    daily = [(start, capital)] + [(int(stamp + DAY), float(mark / cost_basis * capital * (1 - slippage) * (1 - fee)))
                                   for stamp, mark in frame.close.items()]
     return {"return": daily[-1][1] / capital - 1, "curve": daily}
 
@@ -154,17 +154,17 @@ def daily_correlation(a, b):
 
 
 def evidence_id(spec, preset, names, trend, reversion):
-    payload = [ENGINE_VERSION, spec.model_dump(mode="json"), preset, names,
+    payload = [ENGINE_VERSION, spec.evidence_spec(), preset, names,
                trend.model_dump(mode="json"), reversion.model_dump(mode="json")]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def walk_forward(market, variants, windows, preset, family, capital):
+def walk_forward(market, variants, windows, preset, family, capital, costs):
     choices, records = [], []
     for train, test, end in windows:
         candidates = []
         for index in range(len(variants)):
-            result = simulate(market, variants, [(train, {family: index})], (family,), preset, train, test, capital)
+            result = simulate(market, variants, [(train, {family: index})], (family,), preset, train, test, capital, **costs)
             candidates.append(summary(result))
         winner = max(range(len(candidates)), key=lambda i: (
             candidates[i]["trades"] >= 5, candidates[i]["net_return"] - 0.5 * candidates[i]["max_drawdown"],
@@ -176,7 +176,7 @@ def walk_forward(market, variants, windows, preset, family, capital):
         records.append({"train_start": train, "test_start": test, "test_end": end, "variant": winner,
                         "parameters": config.model_dump(), "train": candidates[winner], "train_candidates": candidates})
     start, end = windows[0][1], windows[-1][2]
-    unseen = simulate(market, variants, choices, (family,), preset, start, end, capital)
+    unseen = simulate(market, variants, choices, (family,), preset, start, end, capital, **costs)
     for record in records:
         record["test"] = summary(unseen, record["test_start"], record["test_end"])
         record["overfit"] = overfit(record["train"], record["test"])
@@ -194,6 +194,7 @@ def run_tournament(spec, cache, progress=lambda *_: None):
     windows = folds(spec.start, spec.end)
     start, end = windows[0][1], windows[-1][2]
     settings = variant_settings(spec)
+    costs = {"fee": spec.fee_per_side, "slippage": spec.slippage_per_side}
     rules = market_rules(cache, spec.universe)
 
     def load(left, right, name, *, stress_window=False):
@@ -213,20 +214,20 @@ def run_tournament(spec, cache, progress=lambda *_: None):
         asset_data = load(left, right, name, stress_window=True)
         spot = spot_daily(cache, left, right)
         stress.append((name, left, right, *asset_data,
-                       {s: benchmark(frame, spec.capital)["return"] for s, frame in spot.items()}))
-    benchmarks = {s: benchmark(frame, spec.capital) for s, frame in spot_daily(cache, start, end).items()}
+                       {s: benchmark(frame, spec.capital, **costs)["return"] for s, frame in spot.items()}))
+    benchmarks = {s: benchmark(frame, spec.capital, **costs) for s, frame in spot_daily(cache, start, end).items()}
 
     reports = {}
     for preset in PRESETS:
         results, schedules, sims, metrics = {}, {}, {}, {}
         for family in FAMILIES:
             progress(f"{preset} · testing strategy {family}")
-            report, schedules[family], sims[family] = walk_forward(market, variants, windows, preset, family, spec.capital)
+            report, schedules[family], sims[family] = walk_forward(market, variants, windows, preset, family, spec.capital, costs)
             selected = schedules[family][-1][1][family]
             report["stress"] = []
             for name, left, right, segment, parameters, reference in stress:
                 simulation = simulate(segment, parameters, [(left, {family: selected})], (family,), preset,
-                                      left, right, spec.capital)
+                                      left, right, spec.capital, **costs)
                 report["stress"].append({"name": name, "start": left, "end": right,
                                          "metrics": summary(simulation), "benchmarks": reference,
                                          "universe": list(segment.candles)})
@@ -240,7 +241,7 @@ def run_tournament(spec, cache, progress=lambda *_: None):
         if len(names) == 2:
             joint = [(stamp, {**parameters, **schedules["B"][i][1]})
                      for i, (stamp, parameters) in enumerate(schedules["A"])]
-            run = simulate(market, variants, joint, names, preset, start, end, spec.capital)
+            run = simulate(market, variants, joint, names, preset, start, end, spec.capital, **costs)
             portfolio = {"aggregate": summary(run), "equity": curve(run), "monte_carlo": monte_carlo(run.trades),
                          "trades_by_family": {f: sum(t["family"] == f for t in run.trades) for f in names}}
         deployment = None
@@ -252,9 +253,9 @@ def run_tournament(spec, cache, progress=lambda *_: None):
         reports[preset] = {"strategies": results, "selected": names, "daily_correlation": correlation,
                            "deployment": deployment, "portfolio": portfolio}
     return {
-        "kind": f"tournament-{ENGINE_VERSION}", "spec": spec.model_dump(mode="json"), "qualification": spec.canonical,
+        "kind": f"tournament-{ENGINE_VERSION}", "spec": spec.evidence_spec() if spec.canonical else spec.model_dump(mode="json"), "qualification": spec.canonical,
         "oos_start": start, "oos_end": end, "hourly_bars": (end - start) // 3600,
-        "fee_per_side": FEE, "slippage_per_side": SLIP, "contract_filters": rules,
+        "fee_per_side": spec.fee_per_side, "slippage_per_side": spec.slippage_per_side, "contract_filters": rules,
         "seconds": time.perf_counter() - begin, "presets": reports, "benchmarks": benchmarks,
     }
 
@@ -264,10 +265,13 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=date.fromisoformat, default=BASELINE_SPEC.start)
     parser.add_argument("--end", type=date.fromisoformat, default=BASELINE_SPEC.end)
     parser.add_argument("--capital", type=float, default=BASELINE_SPEC.capital)
+    parser.add_argument("--fee", type=float, default=FEE, help="Taker fee per side as a decimal")
+    parser.add_argument("--slippage", type=float, default=SLIP, help="Adverse slippage per side as a decimal")
     parser.add_argument("--cache", type=Path, default=Path("data/archive"))
     parser.add_argument("--output", type=Path, default=Path("data/tournament.json"))
     args = parser.parse_args()
-    result = run_tournament(TournamentSpec(start=args.start, end=args.end, capital=args.capital), args.cache,
+    result = run_tournament(TournamentSpec(start=args.start, end=args.end, capital=args.capital, fee_per_side=args.fee,
+                                           slippage_per_side=args.slippage), args.cache,
                             lambda note: print(note, flush=True))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, allow_nan=False))

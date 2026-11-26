@@ -152,7 +152,7 @@ class ResearchTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "app/edge-baseline.json.gz"
         with gzip.open(path, "rt") as source:
             report = json.load(source)
-        self.assertEqual(report["spec"], BASELINE_SPEC.model_dump(mode="json"))
+        self.assertEqual(report["spec"], BASELINE_SPEC.evidence_spec())
         self.assertEqual(report["hourly_bars"], 17520)
         for preset in report["presets"].values():
             for family, result in preset["strategies"].items():

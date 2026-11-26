@@ -60,6 +60,8 @@ class TournamentSpec(BaseModel):
     universe: tuple[str, ...] = Field(DEFAULT_UNIVERSE, validate_default=True)
     trend: Trend = Trend()
     reversion: Reversion = Reversion()
+    fee_per_side: float = Field(FEE, ge=0, le=0.05, allow_inf_nan=False)
+    slippage_per_side: float = Field(SLIP, ge=0, le=0.05, allow_inf_nan=False)
 
     @field_validator("universe")
     @classmethod
@@ -78,6 +80,9 @@ class TournamentSpec(BaseModel):
         if self.start < date(2021, 1, 1) or self.end > date.today().replace(day=1):
             raise ValueError("Use completed archive months beginning January 2021 or later")
         return self
+
+    def evidence_spec(self):
+        return self.model_dump(mode="json", exclude={"fee_per_side", "slippage_per_side"})
 
     @property
     def canonical(self):
