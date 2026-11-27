@@ -1,8 +1,8 @@
 name: One-minute strategy research
 
 on:
-  push:
-    branches: [research/one-minute-entry]
+  pull_request:
+    branches: [main]
     paths:
       - app/minute_research.py
       - tests/test_minute_research.py
@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   backtest:
+    if: github.head_ref == 'research/one-minute-entry' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
