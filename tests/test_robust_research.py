@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from app.risk import Risk
-from app.robust_research import Asset, CAPITAL, SYMBOLS, fill_size, market_regime
+from app.robust_research import Asset, CAPITAL, SYMBOLS, DAY, MINUTE, WARM, Events, Rule, evaluate, fill_size, market_regime
 
 
 class RobustResearchTests(unittest.TestCase):
@@ -24,6 +24,18 @@ class RobustResearchTests(unittest.TestCase):
         self.assertEqual(len(regime), 23)
         self.assertFalse(regime[20])
         self.assertTrue(regime[21])
+
+    def test_open_position_in_archive_gap_exits_adversely_on_reopen(self):
+        prices = np.ones((DAY // MINUTE, 4))
+        prices[2] = np.nan
+        asset = Asset(prices, np.full(len(prices), 100_000.), np.zeros(len(prices)), pd.DataFrame())
+        market = {s: asset for s in SYMBOLS}
+        events = Events(np.array([1]), np.array([3]), np.array([1]), np.array([0.002]),
+                        np.array([1.0]), Rule("trend", 60, 24))
+        result, trades, _ = evaluate(market, events, WARM, WARM + DAY)
+        self.assertEqual(result["trades"], 1)
+        self.assertEqual(trades[0].closed, WARM + 3 * MINUTE)
+        self.assertLess(trades[0].pnl, -0.30)
 
 
 if __name__ == "__main__":

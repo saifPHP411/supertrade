@@ -99,10 +99,10 @@ def downloaded(cache, times):
     final = {}
     for s in SYMBOLS:
         candles = pd.concat(parts.pop((s, False))).sort_index()
-        if not np.array_equal(candles.index, times) or not np.isfinite(candles.values).all():
-            raise MarketDataError(f"Incomplete or invalid 1m history for {s}")
-        bars = np.ascontiguousarray(candles[FIELDS].to_numpy())
-        o, high, low, c = bars.T
+        if (candles.index.has_duplicates or not candles.index.isin(times).all()
+                or not np.isfinite(candles.values).all()):
+            raise MarketDataError(f"Invalid or duplicate 1m history for {s}")
+        o, high, low, c = candles[FIELDS].to_numpy().T
         if np.any((low <= 0) | (low > np.minimum(o, c)) | (high < np.maximum(o, c))
                   | (candles.quote_volume < 0)):
             raise MarketDataError(f"Invalid OHLC or quote turnover for {s}")
@@ -112,9 +112,18 @@ def downloaded(cache, times):
                 or np.any(offsets >= len(times)) or not np.array_equal(times[offsets], fund.index)
                 or np.diff(np.r_[times[0], fund.index, times[-1]]).max() > DAY):
             raise MarketDataError(f"Incomplete or invalid funding history for {s}")
+        aligned = candles.reindex(times)
+        bars = np.ascontiguousarray(aligned[FIELDS].to_numpy())
+        prior_close = aligned.close.ffill().shift()
+        mark_proxy = aligned.open.fillna(prior_close).to_numpy()[offsets]
+        if not np.isfinite(mark_proxy).all():
+            raise MarketDataError(f"Funding before first executable candle for {s}")
         charges = np.zeros(len(times))
-        charges[offsets] = fund.rate.to_numpy() * o[offsets]
-        final[s] = Asset(bars, candles.quote_volume.rolling(60).mean().shift().to_numpy(), charges, candles)
+        charges[offsets] = fund.rate.to_numpy() * mark_proxy
+        turnover = aligned.quote_volume.rolling(60).mean().shift().to_numpy()
+        final[s] = Asset(bars, turnover, charges, candles)
+        missing = len(times) - len(candles)
+        print(f"{s}: {missing} archive minutes unavailable; no synthetic fills", flush=True)
     return final
 
 
@@ -255,6 +264,9 @@ def evaluate(data, events, start, end, *, fee=FEE, slip=SLIP, delay=0, stop_scal
         asset = data[symbol]
         prices = price_arrays[s]
         arrival = float(prices[i, 0])
+        if not np.isfinite(arrival):
+            skipped += 1
+            continue
         entered = arrival * (1 + d * slip)
         gap = max(3.0 * events.atr[n], 0.008 * arrival) * stop_scale
         q = fill_size(symbol, entered, gap, equity, asset.turnover60[i], d, risk, fee, slip)
@@ -264,13 +276,19 @@ def evaluate(data, events, start, end, *, fee=FEE, slip=SLIP, delay=0, stop_scal
         today += 1
         stop, target = entered - d * gap, entered + d * 2.5 * gap
         deadline, funding = min(right - 1, i + events.rule.hold), 0.
-        for j in range(i, deadline + 1):
+        crossed_gap = False
+        for j in range(i, right):
             o, h, low, c = prices[j]
             now = WARM + j * MINUTE
             snap = (now - start) // DAY
             if j != i:
                 funding -= d * q * asset.funding[j]
-            if j == deadline:
+            if not np.isfinite(o):
+                crossed_gap = True
+                continue
+            if crossed_gap:
+                raw_exit = min(o, stop) if d == 1 else max(o, stop)
+            elif j == deadline:
                 raw_exit = o
             elif d == 1 and low <= stop or d == -1 and h >= stop:
                 raw_exit = min(o, stop) if d == 1 else max(o, stop)
@@ -298,6 +316,8 @@ def evaluate(data, events, start, end, *, fee=FEE, slip=SLIP, delay=0, stop_scal
                                 turnover, max(1, j - i)))
             next_bar = j + 120
             break
+        else:
+            raise MarketDataError(f"{symbol} position could not close within the evaluation window after a data gap")
     daily = pd.Series(np.r_[CAPITAL, by_day]).ffill().to_numpy()
     return stats(trades, daily, risk.worst_drawdown, risk.halted, skipped), trades, daily
 
@@ -359,8 +379,12 @@ def causal_atr(data, rule):
     for s in SYMBOLS:
         _, atr, _ = signal_frame(data[s].candles, rule)
         index = (atr.index.to_numpy() - WARM) // MINUTE
-        expanded = np.repeat(atr.to_numpy(), rule.minutes)
-        result.append((int(index[0]), expanded))
+        first = int(index[0])
+        steps = np.arange(first, int(index[-1]) + rule.minutes)
+        rows = np.searchsorted(index, steps, side="right") - 1
+        last = atr.to_numpy()[rows]
+        last[steps - index[rows] >= rule.minutes] = np.nan
+        result.append((first, last))
     return result
 
 
@@ -374,8 +398,8 @@ def random_events(source, causal, start, end, rng):
     for s, (offset, values) in enumerate(causal):
         mask = assets == s
         idx = times[mask] - offset
-        atr[mask] = values[np.maximum(0, idx)]
-        atr[mask & (times < offset)] = np.nan
+        atr[mask] = values[np.clip(idx, 0, len(values) - 1)]
+        atr[mask & ((times < offset) | (times >= offset + len(values)))] = np.nan
     sort = np.argsort(times, kind="stable")
     idx = sort[np.isfinite(atr[sort]) & (atr[sort] > 0)]
     return Events(times[idx], assets[idx], side[idx], atr[idx], np.ones(len(idx)), source.rule)
@@ -384,7 +408,10 @@ def random_events(source, causal, start, end, rng):
 def buy_hold(data, symbol, start, end):
     left, right = (start - WARM) // MINUTE, (end - WARM) // MINUTE
     asset = data[symbol]
-    o = asset.bars[left:right, 0]
+    raw = asset.bars[left:right, 0]
+    if not np.isfinite(raw[[0, -1]]).all():
+        return None
+    o = pd.Series(raw).ffill().to_numpy()
     original = float(o[0])
     entered = original * (1 + SLIP)
     step, min_qty, min_notional, max_qty = BASELINE_RULES[symbol]
@@ -404,7 +431,7 @@ def buy_hold(data, symbol, start, end):
 
 
 def market_regime(data):
-    basket = np.vstack([d.bars[1439::1440, 3] for d in data.values()])
+    basket = np.vstack([pd.Series(d.bars[:, 3]).ffill().to_numpy()[1439::1440] for d in data.values()])
     # A UTC day's basket return is available at the next day's open.
     closed = np.mean(basket[:, 20:] / basket[:, :-20] - 1, axis=0) > 0
     return np.r_[np.zeros(21, dtype=bool), closed[:-1]], 21
@@ -542,7 +569,8 @@ def main():
     details = test(data)
     details["sample"] = {"symbols": list(SYMBOLS), "bars_per_asset": len(times), "warm": WARM,
                          "validation_start": FIRST, "holdout_start": HOLDOUT, "holdout_end_exclusive": HOLDOUT_END,
-                         "recent_start": RECENT, "end_exclusive": END}
+                         "recent_start": RECENT, "end_exclusive": END,
+                         "missing_minutes": {s: len(times) - len(data[s].candles) for s in SYMBOLS}}
     args.output.write_text(json.dumps(details, indent=2, allow_nan=False) + "\n")
     keep = {k: details[k] for k in ("sample", "validation", "holdout", "holdout_rule",
                                      "selected_diagnostic_family", "ruling", "gates", "concentration",
