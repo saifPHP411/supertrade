@@ -1,4 +1,4 @@
-name: Robust futures falsification
+name: Lower-turnover strategy research
 
 on:
   pull_request:
@@ -13,9 +13,9 @@ permissions:
 
 jobs:
   backtest:
-    if: github.head_ref == 'research/robust-futures' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.head_ref == 'research/lower-turnover' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,6 +29,6 @@ jobs:
         run: python -m app.robust_research
       - uses: actions/upload-artifact@v4
         with:
-          name: robust-futures-research
+          name: lower-turnover-research
           path: robust-research.json
           retention-days: 30

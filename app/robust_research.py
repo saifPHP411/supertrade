@@ -1,4 +1,4 @@
-"""Pre-registered futures strategy falsification. This module never places orders."""
+"""Pre-registered lower-turnover futures research. This module never places orders."""
 from __future__ import annotations
 
 import argparse
@@ -23,8 +23,11 @@ PRESET = "BALANCED"
 MIN_TRADES = 100
 MIN_PF = 1.20
 VOLUME_SHARE = 0.001
-WARM, FIRST, HOLDOUT, END = map(epoch, ("2024-01-01", "2024-07-01", "2026-07-01", "2026-11-01"))
-BOUNDS = tuple(map(epoch, ("2024-01-01", "2024-07-01", "2025-01-01", "2025-07-01", "2026-01-01", "2026-07-01")))
+WARM, FIRST, HOLDOUT, HOLDOUT_END, RECENT, END = map(epoch, (
+    "2021-01-01", "2021-07-01", "2023-01-01", "2023-07-01", "2024-07-01", "2026-11-01",
+))
+BOUNDS = tuple(map(epoch, ("2021-01-01", "2021-07-01", "2022-01-01", "2022-07-01", "2023-01-01")))
+FOLDS = len(BOUNDS) - 2
 FIELDS = ["open", "high", "low", "close"]
 
 
@@ -40,12 +43,14 @@ class Rule:
 
     @property
     def hold(self):
-        return 1440 if self.family in ("trend", "ema") else 240
+        if self.family in ("trend", "ema"):
+            return 4320 if self.minutes == 60 else 10080
+        return 2880 if self.minutes == 60 else 7200
 
 
 GRID = (
-    *[Rule("trend", m, n) for m in (15, 60) for n in (16, 32)],
-    *[Rule("revert", m, z) for m in (1, 5, 15) for z in (1.75, 2.25)],
+    *[Rule("trend", m, n) for m in (60, 240) for n in (24, 48)],
+    *[Rule("pullback", m, z) for m in (60, 240) for z in (1.5, 2.0)],
 )
 BASELINES = (Rule("ema", 60, 48), Rule("plain-revert", 15, 2))
 
@@ -72,7 +77,7 @@ class Events:
 
 
 def downloaded(cache, times):
-    months = pd.period_range("2024-01", "2026-10", freq="M")
+    months = pd.period_range("2021-01", "2026-10", freq="M")
     plan = [(s, m, fund) for s in SYMBOLS for m in months for fund in (False, True)]
     parts = {(s, fund): [] for s in SYMBOLS for fund in (False, True)}
     with httpx.Client(timeout=25, limits=httpx.Limits(max_connections=12)) as client:
@@ -127,8 +132,9 @@ def signal_frame(candles, rule):
     if rule.family == "trend":
         upper = h.shift().rolling(int(rule.parameter)).max()
         lower = low.shift().rolling(int(rule.parameter)).min()
-        longs = (c > upper) & (last <= upper.shift()) & (slope > 0)
-        shorts = (c < lower) & (last >= lower.shift()) & (slope < 0)
+        active = frame.volume >= 1.15 * frame.volume.shift().rolling(24).mean()
+        longs = (c > upper) & (last <= upper.shift()) & (slope > 0) & active
+        shorts = (c < lower) & (last >= lower.shift()) & (slope < 0) & active
         strength = (c - ema).abs() / atr
     elif rule.family == "ema":
         longs, shorts = (c > ema) & (last <= ema.shift()), (c < ema) & (last >= ema.shift())
@@ -140,9 +146,9 @@ def signal_frame(candles, rule):
         old = z.shift()
         longs = (old <= -rule.parameter) & (z > -rule.parameter) & (z < 0)
         shorts = (old >= rule.parameter) & (z < rule.parameter) & (z > 0)
-        if rule.family == "revert":
-            longs &= (slope.abs() <= 1.5 * atr) & (c >= ema - 2 * atr)
-            shorts &= (slope.abs() <= 1.5 * atr) & (c <= ema + 2 * atr)
+        if rule.family == "pullback":
+            longs &= (slope > 0) & (c >= ema - atr)
+            shorts &= (slope < 0) & (c <= ema + atr)
         strength = old.abs()
     side = longs.astype(np.int8) - shorts.astype(np.int8)
     selection = (side != 0) & (atr > 0) & np.isfinite(strength)
@@ -243,20 +249,20 @@ def evaluate(data, events, start, end, *, fee=FEE, slip=SLIP, delay=0, stop_scal
         risk.observe(stamp, equity, PRESET)
         if trade_day != stamp // DAY:
             trade_day, today = stamp // DAY, 0
-        if today >= 4 or not risk.permitted(stamp):
+        if today >= 2 or not risk.permitted(stamp):
             continue
         symbol = SYMBOLS[s]
         asset = data[symbol]
         prices = price_arrays[s]
         arrival = float(prices[i, 0])
         entered = arrival * (1 + d * slip)
-        gap = max(2.5 * events.atr[n], 0.004 * arrival) * stop_scale
+        gap = max(3.0 * events.atr[n], 0.008 * arrival) * stop_scale
         q = fill_size(symbol, entered, gap, equity, asset.turnover60[i], d, risk, fee, slip)
         if not q:
             skipped += 1
             continue
         today += 1
-        stop, target = entered - d * gap, entered + d * 2 * gap
+        stop, target = entered - d * gap, entered + d * 2.5 * gap
         deadline, funding = min(right - 1, i + events.rule.hold), 0.
         for j in range(i, deadline + 1):
             o, h, low, c = prices[j]
@@ -290,7 +296,7 @@ def evaluate(data, events, start, end, *, fee=FEE, slip=SLIP, delay=0, stop_scal
             risk.closed(now, pnl)
             trades.append(Trade(s, d, stamp, now, pnl, gross, commission, slip_bill, funding,
                                 turnover, max(1, j - i)))
-            next_bar = j + 15
+            next_bar = j + 120
             break
     daily = pd.Series(np.r_[CAPITAL, by_day]).ffill().to_numpy()
     return stats(trades, daily, risk.worst_drawdown, risk.halted, skipped), trades, daily
@@ -426,7 +432,7 @@ def test(data):
         key = f"{family}-{minutes}m"
         rules = [r for r in GRID if (r.family, r.minutes) == (family, minutes)]
         results, selected, fits = [], [], []
-        for fold in range(4):
+        for fold in range(FOLDS):
             start, split, end = BOUNDS[fold:fold + 3]
             train = [(r, evaluate(data, hist(r), start, split)[0]) for r in rules]
             chosen, fit = max(train, key=lambda item: score(item[1]))
@@ -448,7 +454,7 @@ def test(data):
 
     selected = max(all_results, key=ranking)
     chosen_rule = wf_rules[selected][-1]
-    wf_windows = [(BOUNDS[i + 1], BOUNDS[i + 2]) for i in range(4)]
+    wf_windows = [(BOUNDS[i + 1], BOUNDS[i + 2]) for i in range(FOLDS)]
 
     def walk(rules=None, **stress):
         use = wf_rules[selected] if rules is None else rules
@@ -457,10 +463,12 @@ def test(data):
 
     def both(rules=None, hold=None, **kwargs):
         return {"walk_forward": walk(rules, **kwargs),
-                "holdout": evaluate(data, hist(chosen_rule if hold is None else hold), HOLDOUT, END, **kwargs)[0]}
+                "holdout": evaluate(data, hist(chosen_rule if hold is None else hold), HOLDOUT, HOLDOUT_END, **kwargs)[0]}
 
     wf, wf_trades = pooled(wfruns[selected])
-    oos, trades, _ = evaluate(data, hist(chosen_rule), HOLDOUT, END)
+    oos, trades, _ = evaluate(data, hist(chosen_rule), HOLDOUT, HOLDOUT_END)
+    recent = evaluate(data, hist(chosen_rule), RECENT, END)[0]
+    recent_costs = evaluate(data, hist(chosen_rule), RECENT, END, fee=FEE * 1.5, slip=SLIP * 2)[0]
     stresses = {
         "double_slippage": both(slip=SLIP * 2),
         "higher_fee": both(fee=FEE * 1.5),
@@ -482,9 +490,9 @@ def test(data):
     for t in trades:
         m = pd.Timestamp(t.closed, unit="s").strftime("%Y-%m")
         month[m] = month.get(m, 0.) + t.pnl
-    benchmark = {r.family: both([r] * 4, r) for r in BASELINES}
+    benchmark = {r.family: both([r] * FOLDS, r) for r in BASELINES}
     benchmark["buy_and_hold_futures"] = {
-        s: {"walk_forward": buy_hold(data, s, FIRST, HOLDOUT), "holdout": buy_hold(data, s, HOLDOUT, END)}
+        s: {"walk_forward": buy_hold(data, s, FIRST, HOLDOUT), "holdout": buy_hold(data, s, HOLDOUT, HOLDOUT_END)}
         for s in SYMBOLS
     }
     used = set(wf_rules[selected])
@@ -495,8 +503,8 @@ def test(data):
         jobs = [(start, end, rule) for (start, end), rule in zip(wf_windows, wf_rules[selected])]
         wf_r = pooled([evaluate(data, random_events(hist(rule), rand_atr[rule], start, end, rng), start, end)
                        for start, end, rule in jobs])[0]
-        hold_r = evaluate(data, random_events(hist(chosen_rule), rand_atr[chosen_rule], HOLDOUT, END, rng),
-                          HOLDOUT, END)[0]
+        hold_r = evaluate(data, random_events(hist(chosen_rule), rand_atr[chosen_rule], HOLDOUT, HOLDOUT_END, rng),
+                          HOLDOUT, HOLDOUT_END)[0]
         for side, metrics in (("walk_forward", wf_r), ("holdout", hold_r)):
             random_metrics[side].append(metrics)
     benchmark["matched_random_12_seeds"] = {
@@ -507,12 +515,14 @@ def test(data):
     neighbors = [name for name in stresses if name.startswith(("parameter_", "stop_"))]
     gates = {
         "walk_forward": metrics_ok(wf), "holdout": metrics_ok(oos),
+        "recent_replication": metrics_ok(recent) and metrics_ok(recent_costs),
         "joint_costs": all(metrics_ok(v) for v in stresses["joint_costs"].values()),
         "concentration": wf_con["passes"] and held_con["passes"],
         "parameter_sensitivity": all(stress_ok(v) for name in neighbors for v in stresses[name].values()),
     }
     details = {
-        "validation": wf, "holdout": oos, "holdout_rule": chosen_rule.name, "selected_diagnostic_family": selected,
+        "validation": wf, "holdout": oos, "recent_replication": recent,
+        "recent_replication_stress": recent_costs, "holdout_rule": chosen_rule.name, "selected_diagnostic_family": selected,
         "ruling": "DEMO" if all(gates.values()) else "REJECT", "gates": gates, "all_families": all_results,
         "cost_and_delay_stress": stresses, "assets": per_asset, "leave_one_asset_out": drop_asset,
         "regimes": regimes, "concentration": {"walk_forward": wf_con, "holdout": held_con},
@@ -531,10 +541,12 @@ def main():
     data = downloaded(args.cache, times)
     details = test(data)
     details["sample"] = {"symbols": list(SYMBOLS), "bars_per_asset": len(times), "warm": WARM,
-                         "validation_start": FIRST, "holdout_start": HOLDOUT, "end_exclusive": END}
+                         "validation_start": FIRST, "holdout_start": HOLDOUT, "holdout_end_exclusive": HOLDOUT_END,
+                         "recent_start": RECENT, "end_exclusive": END}
     args.output.write_text(json.dumps(details, indent=2, allow_nan=False) + "\n")
     keep = {k: details[k] for k in ("sample", "validation", "holdout", "holdout_rule",
                                      "selected_diagnostic_family", "ruling", "gates", "concentration",
+                                     "recent_replication", "recent_replication_stress",
                                      "holdout_monthly_realized_pnl_usdt")}
     def compact(items):
         return {k: {side: [m["net_return"], m["profit_factor"], m["trades"], m["max_drawdown"]]
@@ -549,7 +561,7 @@ def main():
     }
     keep["buy_hold"] = {s: {side: m["net_return"] if m else None for side, m in v.items()}
                         for s, v in details["benchmarks"]["buy_and_hold_futures"].items()}
-    print("ROBUST_RESULT " + json.dumps(keep, allow_nan=False), flush=True)
+    print("SLOW_RESULT " + json.dumps(keep, allow_nan=False), flush=True)
 
 
 if __name__ == "__main__":
