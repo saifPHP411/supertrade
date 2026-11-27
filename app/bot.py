@@ -16,6 +16,7 @@ import httpx
 from .config import BAR, DAY, FEE, MAX_RISK, PRESETS, SLIP, Deployment
 from .exchange import Binance, ExchangeError
 from .gate import live_gate
+from .paper_preflight import verify_demo
 from .risk import Risk
 from .strategy import (
     build_signals,
@@ -601,6 +602,8 @@ class Bot:
         self.last_error = message
 
     def loop(self):
+        if not self.data.get("resume") and not self.data["positions"] and not self.data["flatten"]:
+            verify_demo()
         delay = 12
         while not self.stopping.is_set():
             with self.lock:
