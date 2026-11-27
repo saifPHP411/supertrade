@@ -109,7 +109,7 @@ class Binance:
         step = filters["MARKET_LOT_SIZE"]["stepSize"]
         if float(step) == 0:
             step = filters["LOT_SIZE"]["stepSize"]
-        rounded = ccxt.Exchange.decimal_to_precision(str(quantity), ccxt.TRUNCATE, step, ccxt.TICK_SIZE)
+        rounded = ccxt.decimal_to_precision(str(quantity), ccxt.TRUNCATE, step, ccxt.TICK_SIZE)
         min_notional = float(filters.get("MIN_NOTIONAL", {}).get("notional", 0))
         lot = filters["MARKET_LOT_SIZE"]
         if entry and (float(rounded) < float(lot["minQty"]) or float(rounded) * price < min_notional
@@ -124,7 +124,7 @@ class Binance:
             count = (Decimal(str(price)) / step).to_integral_value(
                 rounding=ROUND_CEILING if stop_side == 1 else ROUND_FLOOR)
             return format(count * step, "f")
-        return ccxt.Exchange.decimal_to_precision(str(price), ccxt.ROUND, tick, ccxt.TICK_SIZE)
+        return ccxt.decimal_to_precision(str(price), ccxt.ROUND, tick, ccxt.TICK_SIZE)
 
     def market_order(self, symbol, side, quantity, client_id, reduce=False):
         return self.write("fapiPrivatePostOrder", {

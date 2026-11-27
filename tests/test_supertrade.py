@@ -252,6 +252,18 @@ class ExecutionTests(unittest.TestCase):
             adapter = Binance("paper", "fixture-key", "fixture-secret", env, lambda: None)
             self.assertTrue(adapter.exchange.urls["api"]["fapiPrivate"].startswith(f"https://{host}/"))
 
+    def test_binance_adapter_uses_real_ccxt_market_and_tick_precision(self):
+        adapter = Binance("paper", "fixture-key", "fixture-secret", "demo", lambda: None)
+        adapter.market_rules["XRP"] = {"filters": [
+            {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.1", "minQty": "0.1", "maxQty": "1000"},
+            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+        ]}
+        self.assertEqual(adapter.quantity("XRP", 5.39, 0.9784), "5.3")
+        self.assertIsNone(adapter.quantity("XRP", 0.19, 0.9784))
+        self.assertEqual(adapter.quantity("XRP", 0.19, 0.9784, entry=False), "0.1")
+        self.assertEqual(adapter.tick_price("XRP", 0.97845), "0.9785")
+
     def test_paper_gate_requires_14_days_20_trades_and_one_continuous_weekend(self):
         start = epoch(date(2025, 1, 1))
         def state(days=14, n=20, eq=50.5, fragmented=False):
